@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -115,7 +116,38 @@ func (h *ProxyHandler) Start(w http.ResponseWriter, r *http.Request) {
 		slog.Info("Proxy session ended", "id", sess.ID)
 	}()
 
-	slog.Info("Proxy started", "id", sess.ID, "port", req.Port, "context", req.Context)
+	// CRITICAL: Wait for kubectl proxy to actually start listening on the port
+	// kubectl proxy might start but fail immediately (auth errors, port in use, etc.)
+	maxRetries := 30 // 3 seconds total
+	proxyReady := false
+	for i := 0; i < maxRetries; i++ {
+		time.Sleep(100 * time.Millisecond)
+
+		// Check if process is still running
+		if sess.Cmd.ProcessState != nil && sess.Cmd.ProcessState.Exited() {
+			h.sessionMgr.Stop(sess.ID)
+			slog.Error("kubectl proxy exited immediately", "port", req.Port, "context", req.Context)
+			http.Error(w, "kubectl proxy failed to start (process exited)", http.StatusInternalServerError)
+			return
+		}
+
+		// Try to connect to the proxy port
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", req.Port), 100*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			proxyReady = true
+			break
+		}
+	}
+
+	if !proxyReady {
+		h.sessionMgr.Stop(sess.ID)
+		slog.Error("kubectl proxy did not start listening", "port", req.Port, "context", req.Context)
+		http.Error(w, "kubectl proxy failed to start listening on port", http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("Proxy started and verified", "id", sess.ID, "port", req.Port, "context", req.Context)
 
 	response := ProxyStartResponse{
 		SessionID: sess.ID,
