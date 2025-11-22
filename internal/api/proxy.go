@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/kubedeskpro/kubedesk-helper/internal/env"
 	"github.com/kubedeskpro/kubedesk-helper/internal/session"
 )
 
@@ -85,7 +86,7 @@ func (h *ProxyHandler) Start(w http.ResponseWriter, r *http.Request) {
 	args = append(args, "--port", strconv.Itoa(req.Port))
 
 	cmd := exec.Command(kubectlPath, args...)
-	cmd.Env = os.Environ()
+	cmd.Env = env.GetShellEnvironment()
 
 	// Set kubeconfig if provided
 	if req.Kubeconfig != "" {

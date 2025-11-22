@@ -1,9 +1,10 @@
-.PHONY: all build build-amd64 build-arm64 build-universal clean install test
+.PHONY: all build build-amd64 build-arm64 build-universal clean install test release
 
 BINARY_NAME=kubedesk-helper
 VERSION=2.0.0
 BUILD_DIR=build
 INSTALL_DIR=/usr/local/bin
+RELEASE_DIR=$(BUILD_DIR)/release
 
 all: build-universal
 
@@ -72,4 +73,25 @@ deps:
 # Show version
 version:
 	@echo "$(BINARY_NAME) version $(VERSION)"
+
+# Create release tarball
+# Usage: make release VERSION=x.y.z
+release:
+ifndef VERSION
+	$(error VERSION is required. Usage: make release VERSION=x.y.z)
+endif
+	@echo "Creating release $(VERSION)..."
+	@mkdir -p $(RELEASE_DIR)
+	@echo "Building ARM64 binary for version $(VERSION)..."
+	@GOARCH=arm64 GOOS=darwin go build -ldflags "-X main.version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY_NAME)-arm64 .
+	@echo "Building AMD64 binary for version $(VERSION)..."
+	@GOARCH=amd64 GOOS=darwin go build -ldflags "-X main.version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY_NAME)-amd64 .
+	@echo "Creating universal binary..."
+	@lipo -create -output $(BUILD_DIR)/$(BINARY_NAME) \
+		$(BUILD_DIR)/$(BINARY_NAME)-arm64 \
+		$(BUILD_DIR)/$(BINARY_NAME)-amd64
+	@echo "Creating tarball..."
+	@tar -czf $(RELEASE_DIR)/$(BINARY_NAME)-$(VERSION).tar.gz -C $(BUILD_DIR) $(BINARY_NAME)
+	@echo "Release tarball created: $(RELEASE_DIR)/$(BINARY_NAME)-$(VERSION).tar.gz"
+	@shasum -a 256 $(RELEASE_DIR)/$(BINARY_NAME)-$(VERSION).tar.gz
 

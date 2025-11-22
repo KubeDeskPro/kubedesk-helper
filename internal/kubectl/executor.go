@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/kubedeskpro/kubedesk-helper/internal/env"
 )
 
 // Result represents the result of a kubectl command execution
@@ -29,8 +31,8 @@ func Execute(ctx context.Context, args []string, kubeconfig, contextName string)
 	// Build command
 	cmd := exec.CommandContext(ctx, kubectlPath, args...)
 
-	// Set environment
-	cmd.Env = os.Environ()
+	// Set environment with user's shell environment
+	cmd.Env = env.GetShellEnvironment()
 
 	// Set kubeconfig if provided
 	if kubeconfig != "" {
@@ -81,7 +83,7 @@ func Execute(ctx context.Context, args []string, kubeconfig, contextName string)
 }
 
 // ExecuteCommand runs an arbitrary command (for exec-auth)
-func ExecuteCommand(ctx context.Context, command string, args []string, env map[string]string) (*Result, error) {
+func ExecuteCommand(ctx context.Context, command string, args []string, envVars map[string]string) (*Result, error) {
 	// Find command binary
 	cmdPath, err := exec.LookPath(command)
 	if err != nil {
@@ -91,9 +93,9 @@ func ExecuteCommand(ctx context.Context, command string, args []string, env map[
 	// Build command
 	cmd := exec.CommandContext(ctx, cmdPath, args...)
 
-	// Set environment
-	cmd.Env = os.Environ()
-	for k, v := range env {
+	// Set environment with user's shell environment
+	cmd.Env = env.GetShellEnvironment()
+	for k, v := range envVars {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
 

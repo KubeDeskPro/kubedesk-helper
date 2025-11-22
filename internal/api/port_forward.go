@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/kubedeskpro/kubedesk-helper/internal/env"
 	"github.com/kubedeskpro/kubedesk-helper/internal/session"
 )
 
@@ -101,7 +102,7 @@ func (h *PortForwardHandler) Start(w http.ResponseWriter, r *http.Request) {
 	args = append(args, resource, fmt.Sprintf("%s:%s", req.LocalPort, req.ServicePort))
 
 	cmd := exec.Command(kubectlPath, args...)
-	cmd.Env = os.Environ()
+	cmd.Env = env.GetShellEnvironment()
 
 	// Set kubeconfig if provided
 	if req.Kubeconfig != "" {

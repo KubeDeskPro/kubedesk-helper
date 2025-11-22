@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/gorilla/mux"
+	"github.com/kubedeskpro/kubedesk-helper/internal/env"
 	"github.com/kubedeskpro/kubedesk-helper/internal/session"
 )
 
@@ -92,7 +93,7 @@ func (h *ExecHandler) Start(w http.ResponseWriter, r *http.Request) {
 	args = append(args, req.Command...)
 
 	cmd := exec.Command(kubectlPath, args...)
-	cmd.Env = os.Environ()
+	cmd.Env = env.GetShellEnvironment()
 
 	// Set kubeconfig if provided
 	if req.Kubeconfig != "" {
