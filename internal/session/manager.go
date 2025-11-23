@@ -18,6 +18,7 @@ const (
 	TypePortForward SessionType = "port-forward"
 	TypeExec        SessionType = "exec"
 	TypeProxy       SessionType = "proxy"
+	TypeShell       SessionType = "shell"
 )
 
 // SessionStatus represents the status of a session
@@ -47,13 +48,17 @@ type Session struct {
 	Port         int
 	Context      string
 	Kubeconfig   string
-	
-	// For exec sessions
+
+	// For exec and shell sessions
 	stdin        io.WriteCloser
 	outputBuffer *bytes.Buffer
 	outputMutex  sync.RWMutex
 	lastReadTime time.Time
 	WriteInput   func(string) error
+
+	// For shell sessions
+	ShellCommand string
+	ExitCode     *int32
 }
 
 // Manager manages all active sessions

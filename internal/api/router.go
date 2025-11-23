@@ -13,6 +13,7 @@ func NewRouter(version string, sessionMgr *session.Manager) *mux.Router {
 	healthHandler := &HealthHandler{version: version}
 	kubectlHandler := &KubectlHandler{}
 	execAuthHandler := &ExecAuthHandler{}
+	shellHandler := &ShellHandler{sessionMgr: sessionMgr}
 	portForwardHandler := &PortForwardHandler{sessionMgr: sessionMgr}
 	execHandler := &ExecHandler{sessionMgr: sessionMgr}
 	proxyHandler := &ProxyHandler{sessionMgr: sessionMgr}
@@ -21,6 +22,12 @@ func NewRouter(version string, sessionMgr *session.Manager) *mux.Router {
 	r.HandleFunc("/health", healthHandler.Handle).Methods("GET")
 	r.HandleFunc("/kubectl", kubectlHandler.Handle).Methods("POST")
 	r.HandleFunc("/exec-auth", execAuthHandler.Handle).Methods("POST")
+
+	// Shell endpoints
+	r.HandleFunc("/shell/start", shellHandler.Start).Methods("POST")
+	r.HandleFunc("/shell/output/{sessionId}", shellHandler.Output).Methods("GET")
+	r.HandleFunc("/shell/stop/{sessionId}", shellHandler.Stop).Methods("DELETE")
+	r.HandleFunc("/shell/list", shellHandler.List).Methods("GET")
 
 	// Port-forward endpoints
 	r.HandleFunc("/port-forward/start", portForwardHandler.Start).Methods("POST")

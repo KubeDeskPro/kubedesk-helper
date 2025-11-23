@@ -1,0 +1,783 @@
+openapi: 3.0.3
+info:
+  title: KubeDesk Helper API
+  description: |
+    HTTP API for the KubeDesk Helper service that provides unsandboxed operations
+    for the KubeDesk macOS application (distributed via Mac App Store).
+
+    The helper runs as a local HTTP server on port 47823 and enables:
+    - kubectl command execution
+    - Raw bash command execution (pipes, redirects, complex shell features)
+    - Exec-based authentication (AWS EKS, GCP GKE, Azure AKS, etc.)
+    - Port-forwarding sessions
+    - Exec into pods
+    - kubectl proxy
+
+    The helper loads the user's shell environment to ensure access to tools like
+    kubectl, gke-gcloud-auth-plugin, aws CLI, and other exec-based auth plugins.
+  version: 2.0.0
+  contact:
+    name: KubeDesk
+    url: https://github.com/kubedeskpro/kubedesk-helper
+
+servers:
+  - url: http://localhost:47823
+    description: Local helper service
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      description: Returns the helper version and status
+      operationId: getHealth
+      responses:
+        '200':
+          description: Helper is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - version
+                  - status
+                properties:
+                  version:
+                    type: string
+                    example: "2.0.0"
+                  status:
+                    type: string
+                    example: "ok"
+
+  /kubectl:
+    post:
+      summary: Execute kubectl command
+      description: Executes a kubectl command with the provided arguments
+      operationId: executeKubectl
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - args
+              properties:
+                args:
+                  type: array
+                  items:
+                    type: string
+                  example: ["get", "pods", "-n", "default"]
+                kubeconfig:
+                  type: string
+                  description: Optional path to kubeconfig file
+                  example: "/Users/user/.kube/config"
+                context:
+                  type: string
+                  description: Optional kubectl context to use
+                  example: "my-cluster"
+      responses:
+        '200':
+          description: Command executed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - stdout
+                  - stderr
+                  - exit_code
+                properties:
+                  stdout:
+                    type: string
+                  stderr:
+                    type: string
+                  exit_code:
+                    type: integer
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Command execution failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /exec-auth:
+    post:
+      summary: Execute authentication command
+      description: |
+        Executes an exec-based authentication command from kubeconfig.
+        Used for cloud provider authentication (AWS EKS, GCP GKE, Azure AKS, etc.)
+      operationId: executeExecAuth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - command
+              properties:
+                command:
+                  type: string
+                  description: Command to execute
+                  example: "aws"
+                args:
+                  type: array
+                  items:
+                    type: string
+                  example: ["eks", "get-token", "--cluster-name", "my-cluster"]
+                env:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: Environment variables
+                  example:
+                    AWS_PROFILE: "default"
+      responses:
+        '200':
+          description: Authentication command executed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - stdout
+                  - stderr
+                  - exit_code
+                properties:
+                  stdout:
+                    type: string
+                    description: Standard output (typically JSON credential response)
+                  stderr:
+                    type: string
+                  exit_code:
+                    type: integer
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Command execution failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /shell/start:
+    post:
+      summary: Start shell command session
+      description: |
+        Starts a bash command session via /bin/bash -c.
+        Supports full shell features including pipes, redirects, environment variables,
+        wildcards, command substitution, and complex pipelines.
+
+        Unlike the simple kubectl endpoint, this supports long-running commands without
+        arbitrary timeouts (e.g., watch, tail -f). Use /shell/output/{sessionId} to read
+        output and /shell/stop/{sessionId} to terminate the command.
+
+        Examples:
+        - Pipes: kubectl get pods | grep nginx
+        - Redirects: kubectl get pods > /tmp/pods.txt
+        - Multiple commands: kubectl get pods && kubectl get services
+        - Environment variables: export NS=default && kubectl get pods -n $NS
+        - Complex pipelines: kubectl get pods -o json | jq '.items[].metadata.name' | sort
+        - Long-running: watch kubectl get pods
+      operationId: startShell
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - command
+              properties:
+                command:
+                  type: string
+                  description: Full shell command string to execute
+                  example: "kubectl get pods | grep nginx"
+                kubeconfig:
+                  type: string
+                  description: Optional kubeconfig content (will be written to temp file and set as KUBECONFIG env var)
+                  example: "apiVersion: v1\nkind: Config\n..."
+                context:
+                  type: string
+                  description: Optional kubectl context (set as KUBECTL_CONTEXT env var)
+                  example: "my-cluster"
+      responses:
+        '200':
+          description: Shell session started successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - sessionId
+                  - status
+                properties:
+                  sessionId:
+                    type: string
+                    example: "shell-abc123"
+                  status:
+                    type: string
+                    example: "running"
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Failed to start command
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /shell/output/{sessionId}:
+    get:
+      summary: Read output from shell session
+      description: Reads all accumulated output from a shell session since it started.
+      operationId: shellOutput
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "shell-abc123"
+      responses:
+        '200':
+          description: Output retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  output:
+                    type: string
+                    description: Accumulated output from the session (stdout + stderr combined)
+                  timestamp:
+                    type: string
+                    format: date-time
+                  status:
+                    type: string
+                    enum: [running, stopped, failed]
+                  exitCode:
+                    type: integer
+                    format: int32
+                    description: Exit code (only present when command has completed)
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /shell/stop/{sessionId}:
+    delete:
+      summary: Stop shell session
+      description: Stops an active shell session by killing the process
+      operationId: stopShell
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "shell-abc123"
+      responses:
+        '200':
+          description: Session stopped successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Session stopped"
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /shell/list:
+    get:
+      summary: List active shell sessions
+      description: Returns a list of all active shell sessions
+      operationId: listShell
+      responses:
+        '200':
+          description: List of active sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        sessionId:
+                          type: string
+                        command:
+                          type: string
+                        status:
+                          type: string
+                        startedAt:
+                          type: string
+                          format: date-time
+                        exitCode:
+                          type: integer
+                          format: int32
+                          description: Exit code (only present when command has completed)
+
+  /port-forward/start:
+    post:
+      summary: Start port-forward session
+      description: Starts a kubectl port-forward session
+      operationId: startPortForward
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - namespace
+                - podName
+                - localPort
+                - remotePort
+              properties:
+                namespace:
+                  type: string
+                  example: "default"
+                podName:
+                  type: string
+                  example: "my-pod-12345"
+                localPort:
+                  type: integer
+                  example: 8080
+                remotePort:
+                  type: integer
+                  example: 80
+                kubeconfig:
+                  type: string
+                  description: Optional kubeconfig content
+                context:
+                  type: string
+                  description: Optional kubectl context to use
+      responses:
+        '200':
+          description: Port-forward session started
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - sessionId
+                properties:
+                  sessionId:
+                    type: string
+                    example: "pf-abc123"
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Failed to start port-forward
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /port-forward/stop/{sessionId}:
+    delete:
+      summary: Stop port-forward session
+      description: Stops an active port-forward session
+      operationId: stopPortForward
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "pf-abc123"
+      responses:
+        '200':
+          description: Session stopped successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Session stopped"
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /port-forward/list:
+    get:
+      summary: List active port-forward sessions
+      description: Returns a list of all active port-forward sessions
+      operationId: listPortForward
+      responses:
+        '200':
+          description: List of active sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        sessionId:
+                          type: string
+                        namespace:
+                          type: string
+                        podName:
+                          type: string
+                        localPort:
+                          type: integer
+                        remotePort:
+                          type: integer
+
+  /exec/start:
+    post:
+      summary: Start exec session into pod
+      description: Starts an interactive exec session into a pod
+      operationId: startExec
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - namespace
+                - podName
+                - command
+              properties:
+                namespace:
+                  type: string
+                  example: "default"
+                podName:
+                  type: string
+                  example: "my-pod-12345"
+                container:
+                  type: string
+                  description: Optional container name (defaults to first container)
+                  example: "app"
+                command:
+                  type: array
+                  items:
+                    type: string
+                  example: ["/bin/sh"]
+                stdin:
+                  type: boolean
+                  description: Attach stdin
+                  default: true
+                tty:
+                  type: boolean
+                  description: Allocate TTY
+                  default: true
+                kubeconfig:
+                  type: string
+                  description: Optional kubeconfig content
+                context:
+                  type: string
+                  description: Optional kubectl context to use
+      responses:
+        '200':
+          description: Exec session started
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - sessionId
+                properties:
+                  sessionId:
+                    type: string
+                    example: "exec-xyz789"
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Failed to start exec session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /exec/input/{sessionId}:
+    post:
+      summary: Send input to exec session
+      description: Sends input data to an active exec session
+      operationId: execInput
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "exec-xyz789"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - input
+              properties:
+                input:
+                  type: string
+                  description: Input data to send to the session
+                  example: "ls -la\n"
+      responses:
+        '200':
+          description: Input sent successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Input sent"
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /exec/output/{sessionId}:
+    get:
+      summary: Read output from exec session
+      description: Reads output from an active exec session
+      operationId: execOutput
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "exec-xyz789"
+      responses:
+        '200':
+          description: Output retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  output:
+                    type: string
+                    description: Output from the session
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /exec/stop/{sessionId}:
+    delete:
+      summary: Stop exec session
+      description: Stops an active exec session
+      operationId: stopExec
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "exec-xyz789"
+      responses:
+        '200':
+          description: Session stopped successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Session stopped"
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /exec/list:
+    get:
+      summary: List active exec sessions
+      description: Returns a list of all active exec sessions
+      operationId: listExec
+      responses:
+        '200':
+          description: List of active sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        sessionId:
+                          type: string
+                        namespace:
+                          type: string
+                        podName:
+                          type: string
+                        container:
+                          type: string
+
+  /proxy/start:
+    post:
+      summary: Start kubectl proxy
+      description: Starts a kubectl proxy server
+      operationId: startProxy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                port:
+                  type: integer
+                  description: Port for proxy server (default 8001)
+                  example: 8001
+                kubeconfig:
+                  type: string
+                  description: Optional kubeconfig content
+                context:
+                  type: string
+                  description: Optional kubectl context to use
+      responses:
+        '200':
+          description: Proxy started successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - sessionId
+                  - port
+                properties:
+                  sessionId:
+                    type: string
+                    example: "proxy-def456"
+                  port:
+                    type: integer
+                    example: 8001
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Failed to start proxy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /proxy/stop/{sessionId}:
+    delete:
+      summary: Stop kubectl proxy
+      description: Stops an active kubectl proxy session
+      operationId: stopProxy
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "proxy-def456"
+      responses:
+        '200':
+          description: Proxy stopped successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Proxy stopped"
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /proxy/list:
+    get:
+      summary: List active proxy sessions
+      description: Returns a list of all active kubectl proxy sessions
+      operationId: listProxy
+      responses:
+        '200':
+          description: List of active sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        sessionId:
+                          type: string
+                        port:
+                          type: integer
+
+components:
+  schemas:
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          example: "Invalid request"
+
+
