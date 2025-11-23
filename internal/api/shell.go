@@ -79,17 +79,8 @@ func (h *ShellHandler) Start(w http.ResponseWriter, r *http.Request) {
 		}
 		cmd.Env = append(cmd.Env, fmt.Sprintf("KUBECONFIG=%s", tmpFile))
 
-		// Clean up kubeconfig when session ends
-		go func() {
-			// Wait for session to be removed
-			for {
-				time.Sleep(1 * time.Second)
-				if _, ok := h.sessionMgr.Get(sess.ID); !ok {
-					os.Remove(tmpFile)
-					break
-				}
-			}
-		}()
+		// Register temp file for cleanup when session ends
+		sess.TempFiles = append(sess.TempFiles, tmpFile)
 	}
 
 	// Set kubectl context if provided

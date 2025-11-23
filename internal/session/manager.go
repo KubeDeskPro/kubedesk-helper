@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -59,19 +60,62 @@ type Session struct {
 	// For shell sessions
 	ShellCommand string
 	ExitCode     *int32
+
+	// Temporary files to clean up when session ends
+	TempFiles []string
 }
 
 // Manager manages all active sessions
 type Manager struct {
-	sessions map[string]*Session
-	mu       sync.RWMutex
+	sessions              map[string]*Session
+	mu                    sync.RWMutex
+	inactivityTimeout     time.Duration
+	completedTimeout      time.Duration
+	cleanupInterval       time.Duration
+	stopCleanup           chan struct{}
+	onSessionCleanup      func(string) // Callback for cleanup (e.g., delete temp files)
 }
 
 // NewManager creates a new session manager
 func NewManager() *Manager {
-	return &Manager{
-		sessions: make(map[string]*Session),
+	m := &Manager{
+		sessions:          make(map[string]*Session),
+		inactivityTimeout: 30 * time.Minute, // Remove inactive sessions after 30 minutes
+		completedTimeout:  5 * time.Minute,  // Remove completed sessions after 5 minutes
+		cleanupInterval:   1 * time.Minute,  // Check every minute
+		stopCleanup:       make(chan struct{}),
 	}
+
+	// Start background cleanup goroutine
+	go m.cleanupLoop()
+
+	return m
+}
+
+// SetInactivityTimeout sets the timeout for inactive sessions
+func (m *Manager) SetInactivityTimeout(timeout time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inactivityTimeout = timeout
+}
+
+// SetCompletedTimeout sets the timeout for completed sessions
+func (m *Manager) SetCompletedTimeout(timeout time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.completedTimeout = timeout
+}
+
+// SetCleanupCallback sets a callback function that's called when a session is cleaned up
+func (m *Manager) SetCleanupCallback(callback func(string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onSessionCleanup = callback
+}
+
+// Shutdown stops the cleanup goroutine
+func (m *Manager) Shutdown() {
+	close(m.stopCleanup)
 }
 
 // Create creates a new session
@@ -132,9 +176,29 @@ func (m *Manager) Stop(id string) error {
 	}
 
 	session.Status = StatusStopped
+
+	// Clean up temporary files
+	m.cleanupSessionFiles(session)
+
+	// Call cleanup callback if set
+	if m.onSessionCleanup != nil {
+		m.onSessionCleanup(id)
+	}
+
 	delete(m.sessions, id)
 	slog.Info("Session stopped", "id", id)
 	return nil
+}
+
+// cleanupSessionFiles removes temporary files associated with a session
+func (m *Manager) cleanupSessionFiles(session *Session) {
+	for _, tmpFile := range session.TempFiles {
+		if err := os.Remove(tmpFile); err != nil && !os.IsNotExist(err) {
+			slog.Warn("Failed to remove temp file", "file", tmpFile, "error", err)
+		} else {
+			slog.Debug("Removed temp file", "file", tmpFile)
+		}
+	}
 }
 
 // StopAll stops all sessions
@@ -149,20 +213,108 @@ func (m *Manager) StopAll() {
 			}
 		}
 		session.Status = StatusStopped
+
+		// Clean up temporary files
+		m.cleanupSessionFiles(session)
+
+		// Call cleanup callback if set
+		if m.onSessionCleanup != nil {
+			m.onSessionCleanup(id)
+		}
 	}
 
 	m.sessions = make(map[string]*Session)
 	slog.Info("All sessions stopped")
 }
 
+// cleanupLoop runs in the background and removes inactive/completed sessions
+func (m *Manager) cleanupLoop() {
+	ticker := time.NewTicker(m.cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.cleanupInactiveSessions()
+		case <-m.stopCleanup:
+			return
+		}
+	}
+}
+
+// cleanupInactiveSessions removes sessions that have been inactive or completed for too long
+func (m *Manager) cleanupInactiveSessions() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	var toRemove []string
+
+	for id, session := range m.sessions {
+		var shouldRemove bool
+		var reason string
+
+		// Check if session is completed and past the completed timeout
+		if session.Status == StatusStopped || session.Status == StatusFailed {
+			if now.Sub(session.lastReadTime) > m.completedTimeout {
+				shouldRemove = true
+				reason = "completed session timeout"
+			}
+		} else {
+			// Check if session is inactive (no reads) for too long
+			if now.Sub(session.lastReadTime) > m.inactivityTimeout {
+				shouldRemove = true
+				reason = "inactivity timeout"
+			}
+		}
+
+		if shouldRemove {
+			toRemove = append(toRemove, id)
+			slog.Info("Cleaning up session",
+				"id", id,
+				"type", session.Type,
+				"reason", reason,
+				"lastReadTime", session.lastReadTime.Format(time.RFC3339),
+				"age", now.Sub(session.StartedAt).String())
+		}
+	}
+
+	// Remove sessions outside the iteration
+	for _, id := range toRemove {
+		session := m.sessions[id]
+
+		// Kill the process if still running
+		if session.Cmd != nil && session.Cmd.Process != nil {
+			if err := session.Cmd.Process.Kill(); err != nil {
+				slog.Warn("Failed to kill process during cleanup", "id", id, "error", err)
+			}
+		}
+
+		// Clean up temporary files
+		m.cleanupSessionFiles(session)
+
+		// Call cleanup callback if set
+		if m.onSessionCleanup != nil {
+			m.onSessionCleanup(id)
+		}
+
+		delete(m.sessions, id)
+	}
+
+	if len(toRemove) > 0 {
+		slog.Info("Cleanup completed", "removed", len(toRemove), "remaining", len(m.sessions))
+	}
+}
 
 
-// ReadOutput reads output from an exec session since the last read
+
+// ReadOutput reads output from an exec session and updates last read time
 func (s *Session) ReadOutput() string {
-	s.outputMutex.RLock()
-	defer s.outputMutex.RUnlock()
+	s.outputMutex.Lock()
+	defer s.outputMutex.Unlock()
 
 	output := s.outputBuffer.String()
+	s.lastReadTime = time.Now() // Update activity timestamp
 	return output
 }
 

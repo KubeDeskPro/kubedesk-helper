@@ -105,6 +105,9 @@ func (h *ExecHandler) Start(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cmd.Env = append(cmd.Env, fmt.Sprintf("KUBECONFIG=%s", tmpFile))
+
+		// Register temp file for cleanup when session ends
+		sess.TempFiles = append(sess.TempFiles, tmpFile)
 	}
 
 	// Setup stdin/stdout/stderr

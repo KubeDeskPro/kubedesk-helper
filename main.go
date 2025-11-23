@@ -61,6 +61,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Stop cleanup goroutine
+	sessionMgr.Shutdown()
+
 	// Stop all sessions
 	sessionMgr.StopAll()
 
