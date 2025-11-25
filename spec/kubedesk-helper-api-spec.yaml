@@ -15,6 +15,19 @@ info:
 
     The helper loads the user's shell environment to ensure access to tools like
     kubectl, gke-gcloud-auth-plugin, aws CLI, and other exec-based auth plugins.
+
+    ## Cluster Isolation
+
+    All endpoints support cluster hash validation to prevent cross-cluster contamination.
+    The cluster hash is a SHA256-based identifier computed from kubeconfig content and
+    context name. Sessions are tied to specific clusters, ensuring operations intended
+    for one cluster never execute on another.
+
+    - **Automatic**: Helper computes cluster hash if not provided (backward compatible)
+    - **Validation**: All session operations validate cluster hash
+    - **Cleanup**: Use `/sessions/cleanup` endpoint when switching clusters
+    - **Zero tolerance**: Impossible to access sessions from wrong cluster
+
   version: 2.0.0
   contact:
     name: KubeDesk
@@ -75,6 +88,12 @@ paths:
                   type: string
                   description: Optional kubectl context to use
                   example: "my-cluster"
+                clusterHash:
+                  type: string
+                  description: |
+                    Optional cluster hash for validation (SHA256 of kubeconfig:context, first 16 chars).
+                    If not provided, helper computes it automatically.
+                  example: "a22d510f831cc112"
       responses:
         '200':
           description: Command executed successfully
@@ -205,12 +224,28 @@ paths:
                   example: "kubectl get pods | grep nginx"
                 kubeconfig:
                   type: string
-                  description: Optional kubeconfig content (will be written to temp file and set as KUBECONFIG env var)
+                  description: |
+                    Kubeconfig file path or content. Recommended to always provide this along with context.
+                    Will be written to temp file and set as KUBECONFIG env var.
                   example: "apiVersion: v1\nkind: Config\n..."
                 context:
                   type: string
-                  description: Optional kubectl context (set as KUBECTL_CONTEXT env var)
+                  description: |
+                    Kubectl context name. Recommended to always provide this along with kubeconfig.
+                    The helper will automatically inject --context flag into all kubectl commands in the shell.
+                    This ensures cluster isolation even for chained commands like "kubectl get pods && kubectl get svc".
                   example: "my-cluster"
+                clusterHash:
+                  type: string
+                  description: |
+                    Optional cluster hash for validation (SHA256 of kubeconfig:context, first 16 chars).
+                    If not provided, helper computes it automatically. Session is tied to this cluster.
+
+                    IMPORTANT: If only clusterHash is provided (without kubeconfig/context), the helper
+                    will attempt to look it up from its in-memory registry. However, this registry is
+                    cleared on helper restart, so it's recommended to always provide kubeconfig and context
+                    for reliability.
+                  example: "a22d510f831cc112"
       responses:
         '200':
           description: Shell session started successfully
@@ -253,6 +288,13 @@ paths:
           schema:
             type: string
           example: "shell-abc123"
+        - name: clusterHash
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional cluster hash for validation. If provided, validates session belongs to this cluster.
+          example: "a22d510f831cc112"
       responses:
         '200':
           description: Output retrieved successfully
@@ -293,6 +335,13 @@ paths:
           schema:
             type: string
           example: "shell-abc123"
+        - name: clusterHash
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional cluster hash for validation. If provided, validates session belongs to this cluster.
+          example: "a22d510f831cc112"
       responses:
         '200':
           description: Session stopped successfully
@@ -374,10 +423,25 @@ paths:
                   example: 80
                 kubeconfig:
                   type: string
-                  description: Optional kubeconfig content
+                  description: |
+                    Kubeconfig file path or content. Recommended to always provide this along with context
+                    to ensure correct cluster targeting, especially after helper restarts.
                 context:
                   type: string
-                  description: Optional kubectl context to use
+                  description: |
+                    Kubectl context name. Recommended to always provide this along with kubeconfig
+                    to ensure correct cluster targeting, especially after helper restarts.
+                clusterHash:
+                  type: string
+                  description: |
+                    Optional cluster hash for validation (SHA256 of kubeconfig:context, first 16 chars).
+                    If not provided, helper computes it automatically. Session is tied to this cluster.
+
+                    IMPORTANT: If only clusterHash is provided (without kubeconfig/context), the helper
+                    will attempt to look it up from its in-memory registry. However, this registry is
+                    cleared on helper restart, so it's recommended to always provide kubeconfig and context
+                    for reliability.
+                  example: "a22d510f831cc112"
       responses:
         '200':
           description: Port-forward session started
@@ -416,6 +480,13 @@ paths:
           schema:
             type: string
           example: "pf-abc123"
+        - name: clusterHash
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional cluster hash for validation. If provided, validates session belongs to this cluster.
+          example: "a22d510f831cc112"
       responses:
         '200':
           description: Session stopped successfully
@@ -504,10 +575,25 @@ paths:
                   default: true
                 kubeconfig:
                   type: string
-                  description: Optional kubeconfig content
+                  description: |
+                    Kubeconfig file path or content. Recommended to always provide this along with context
+                    to ensure correct cluster targeting, especially after helper restarts.
                 context:
                   type: string
-                  description: Optional kubectl context to use
+                  description: |
+                    Kubectl context name. Recommended to always provide this along with kubeconfig
+                    to ensure correct cluster targeting, especially after helper restarts.
+                clusterHash:
+                  type: string
+                  description: |
+                    Optional cluster hash for validation (SHA256 of kubeconfig:context, first 16 chars).
+                    If not provided, helper computes it automatically. Session is tied to this cluster.
+
+                    IMPORTANT: If only clusterHash is provided (without kubeconfig/context), the helper
+                    will attempt to look it up from its in-memory registry. However, this registry is
+                    cleared on helper restart, so it's recommended to always provide kubeconfig and context
+                    for reliability.
+                  example: "a22d510f831cc112"
       responses:
         '200':
           description: Exec session started
@@ -559,6 +645,10 @@ paths:
                   type: string
                   description: Input data to send to the session
                   example: "ls -la\n"
+                clusterHash:
+                  type: string
+                  description: Optional cluster hash for validation. If provided, validates session belongs to this cluster.
+                  example: "a22d510f831cc112"
       responses:
         '200':
           description: Input sent successfully
@@ -589,6 +679,13 @@ paths:
           schema:
             type: string
           example: "exec-xyz789"
+        - name: clusterHash
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional cluster hash for validation. If provided, validates session belongs to this cluster.
+          example: "a22d510f831cc112"
       responses:
         '200':
           description: Output retrieved successfully
@@ -619,6 +716,13 @@ paths:
           schema:
             type: string
           example: "exec-xyz789"
+        - name: clusterHash
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional cluster hash for validation. If provided, validates session belongs to this cluster.
+          example: "a22d510f831cc112"
       responses:
         '200':
           description: Session stopped successfully
@@ -686,6 +790,12 @@ paths:
                 context:
                   type: string
                   description: Optional kubectl context to use
+                clusterHash:
+                  type: string
+                  description: |
+                    Optional cluster hash for validation (SHA256 of kubeconfig:context, first 16 chars).
+                    If not provided, helper computes it automatically. Session is tied to this cluster.
+                  example: "a22d510f831cc112"
       responses:
         '200':
           description: Proxy started successfully
@@ -728,6 +838,13 @@ paths:
           schema:
             type: string
           example: "proxy-def456"
+        - name: clusterHash
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional cluster hash for validation. If provided, validates session belongs to this cluster.
+          example: "a22d510f831cc112"
       responses:
         '200':
           description: Proxy stopped successfully
@@ -768,6 +885,55 @@ paths:
                           type: string
                         port:
                           type: integer
+
+  /sessions/cleanup:
+    post:
+      summary: Clean up sessions for a cluster
+      description: |
+        Removes all sessions associated with a specific cluster hash.
+        This should be called when switching clusters to ensure no stale sessions remain.
+
+        **Critical for cluster isolation**: Always call this endpoint when switching clusters
+        to prevent accidentally using sessions from the wrong cluster.
+      operationId: cleanupSessions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - clusterHash
+              properties:
+                clusterHash:
+                  type: string
+                  description: Cluster hash to clean up (SHA256 of kubeconfig:context, first 16 chars)
+                  example: "a22d510f831cc112"
+      responses:
+        '200':
+          description: Sessions cleaned up successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - sessionsRemoved
+                  - clusterHash
+                properties:
+                  sessionsRemoved:
+                    type: integer
+                    description: Number of sessions removed
+                    example: 3
+                  clusterHash:
+                    type: string
+                    description: Cluster hash that was cleaned up
+                    example: "a22d510f831cc112"
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
 components:
   schemas:

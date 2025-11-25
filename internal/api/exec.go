@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/gorilla/mux"
+	"github.com/kubedeskpro/kubedesk-helper/internal/cluster"
 	"github.com/kubedeskpro/kubedesk-helper/internal/env"
 	"github.com/kubedeskpro/kubedesk-helper/internal/session"
 )
@@ -22,12 +23,13 @@ type ExecHandler struct {
 
 // ExecStartRequest represents an exec start request
 type ExecStartRequest struct {
-	Namespace  string   `json:"namespace"`
-	PodName    string   `json:"podName"`
-	Container  string   `json:"container,omitempty"`
-	Command    []string `json:"command"`
-	Kubeconfig string   `json:"kubeconfig,omitempty"`
-	Context    string   `json:"context,omitempty"`
+	Namespace   string   `json:"namespace"`
+	PodName     string   `json:"podName"`
+	Container   string   `json:"container,omitempty"`
+	Command     []string `json:"command"`
+	Kubeconfig  string   `json:"kubeconfig,omitempty"`
+	Context     string   `json:"context,omitempty"`
+	ClusterHash string   `json:"clusterHash,omitempty"` // Optional: computed by helper if not provided
 }
 
 // ExecStartResponse represents an exec start response
@@ -38,7 +40,8 @@ type ExecStartResponse struct {
 
 // ExecInputRequest represents an exec input request
 type ExecInputRequest struct {
-	Input string `json:"input"`
+	Input       string `json:"input"`
+	ClusterHash string `json:"clusterHash,omitempty"` // Optional: for validation
 }
 
 // ExecOutputResponse represents an exec output response
@@ -63,6 +66,48 @@ func (h *ExecHandler) Start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If kubeconfig/context not provided, try to look up from registry
+	if req.Kubeconfig == "" && req.Context == "" && req.ClusterHash != "" {
+		regKubeconfig, regContext, foundInRegistry := cluster.GetRegistry().Lookup(req.ClusterHash)
+		if !foundInRegistry {
+			slog.Error("Cluster hash not found in registry and kubeconfig/context not provided",
+				"providedHash", req.ClusterHash,
+				"pod", req.PodName,
+				"hint", "This usually happens after helper restart. App should send kubeconfig and context.",
+			)
+			http.Error(w, "Cluster hash not found in registry. Please provide kubeconfig and context in the request.", http.StatusBadRequest)
+			return
+		}
+		req.Kubeconfig = regKubeconfig
+		req.Context = regContext
+		slog.Info("Looked up cluster info from registry",
+			"clusterHash", req.ClusterHash,
+			"context", req.Context,
+		)
+	}
+
+	// Compute cluster hash if not provided
+	if req.ClusterHash == "" {
+		req.ClusterHash = cluster.ComputeAndRegister(req.Kubeconfig, req.Context)
+	} else {
+		// Register the hash with kubeconfig/context for future lookups
+		cluster.GetRegistry().Register(req.ClusterHash, req.Kubeconfig, req.Context)
+	}
+
+	// Validate cluster hash
+	if !cluster.ValidateHash(req.ClusterHash, req.Kubeconfig, req.Context) {
+		expectedHash := cluster.GetExpectedHash(req.Kubeconfig, req.Context)
+		slog.Error("Cluster hash validation failed",
+			"providedHash", req.ClusterHash,
+			"expectedHash", expectedHash,
+			"kubeconfig", req.Kubeconfig,
+			"context", req.Context,
+			"pod", req.PodName,
+		)
+		http.Error(w, "Cluster hash validation failed", http.StatusBadRequest)
+		return
+	}
+
 	// Create session
 	sess := h.sessionMgr.Create(session.TypeExec)
 	sess.Namespace = req.Namespace
@@ -71,6 +116,7 @@ func (h *ExecHandler) Start(w http.ResponseWriter, r *http.Request) {
 	sess.Command = req.Command
 	sess.Context = req.Context
 	sess.Kubeconfig = req.Kubeconfig
+	sess.ClusterHash = req.ClusterHash
 
 	// Find kubectl
 	kubectlPath, err := exec.LookPath("kubectl")
@@ -177,16 +223,31 @@ func (h *ExecHandler) Input(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	sessionID := vars["sessionId"]
 
-	sess, ok := h.sessionMgr.Get(sessionID)
-	if !ok {
-		http.Error(w, "Session not found", http.StatusNotFound)
-		return
-	}
-
 	var req ExecInputRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
+	}
+
+	// Get session with cluster validation if hash provided
+	var sess *session.Session
+	var ok bool
+	if req.ClusterHash != "" {
+		sess, ok = h.sessionMgr.GetWithClusterValidation(sessionID, req.ClusterHash)
+		if !ok {
+			slog.Warn("Session not found or cluster hash mismatch",
+				"sessionId", sessionID,
+				"providedHash", req.ClusterHash,
+			)
+			http.Error(w, "Session not found or cluster mismatch", http.StatusNotFound)
+			return
+		}
+	} else {
+		sess, ok = h.sessionMgr.Get(sessionID)
+		if !ok {
+			http.Error(w, "Session not found", http.StatusNotFound)
+			return
+		}
 	}
 
 	if sess.WriteInput == nil {
@@ -208,10 +269,28 @@ func (h *ExecHandler) Output(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	sessionID := vars["sessionId"]
 
-	sess, ok := h.sessionMgr.Get(sessionID)
-	if !ok {
-		http.Error(w, "Session not found", http.StatusNotFound)
-		return
+	// Get cluster hash from query parameter (optional)
+	clusterHash := r.URL.Query().Get("clusterHash")
+
+	// Get session with cluster validation if hash provided
+	var sess *session.Session
+	var ok bool
+	if clusterHash != "" {
+		sess, ok = h.sessionMgr.GetWithClusterValidation(sessionID, clusterHash)
+		if !ok {
+			slog.Warn("Session not found or cluster hash mismatch",
+				"sessionId", sessionID,
+				"providedHash", clusterHash,
+			)
+			http.Error(w, "Session not found or cluster mismatch", http.StatusNotFound)
+			return
+		}
+	} else {
+		sess, ok = h.sessionMgr.Get(sessionID)
+		if !ok {
+			http.Error(w, "Session not found", http.StatusNotFound)
+			return
+		}
 	}
 
 	output := sess.ReadOutput()
@@ -230,6 +309,23 @@ func (h *ExecHandler) Output(w http.ResponseWriter, r *http.Request) {
 func (h *ExecHandler) Stop(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	sessionID := vars["sessionId"]
+
+	// Get cluster hash from query parameter (optional)
+	clusterHash := r.URL.Query().Get("clusterHash")
+
+	// Validate cluster hash if provided
+	if clusterHash != "" {
+		sess, ok := h.sessionMgr.GetWithClusterValidation(sessionID, clusterHash)
+		if !ok {
+			slog.Warn("Session not found or cluster hash mismatch",
+				"sessionId", sessionID,
+				"providedHash", clusterHash,
+			)
+			http.Error(w, "Session not found or cluster mismatch", http.StatusNotFound)
+			return
+		}
+		_ = sess // We just needed to validate
+	}
 
 	if err := h.sessionMgr.Stop(sessionID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

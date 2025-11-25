@@ -17,6 +17,7 @@ func NewRouter(version string, sessionMgr *session.Manager) *mux.Router {
 	portForwardHandler := &PortForwardHandler{sessionMgr: sessionMgr}
 	execHandler := &ExecHandler{sessionMgr: sessionMgr}
 	proxyHandler := &ProxyHandler{sessionMgr: sessionMgr}
+	sessionCleanupHandler := NewSessionCleanupHandler(sessionMgr)
 
 	// Existing API endpoints (backward compatibility)
 	r.HandleFunc("/health", healthHandler.Handle).Methods("GET")
@@ -44,6 +45,15 @@ func NewRouter(version string, sessionMgr *session.Manager) *mux.Router {
 	r.HandleFunc("/proxy/start", proxyHandler.Start).Methods("POST")
 	r.HandleFunc("/proxy/stop/{sessionId}", proxyHandler.Stop).Methods("DELETE")
 	r.HandleFunc("/proxy/list", proxyHandler.List).Methods("GET")
+
+	// Proxy router - routes requests to the correct kubectl proxy based on cluster hash
+	// This allows the app to make requests through the helper instead of directly to kubectl proxy
+	// Pattern: /proxy/{clusterHash}/api/v1/pods -> routes to kubectl proxy for that cluster
+	proxyRouterHandler := NewProxyRouterHandler(sessionMgr)
+	r.PathPrefix("/proxy/{clusterHash}/").HandlerFunc(proxyRouterHandler.Route)
+
+	// Session cleanup endpoint
+	r.HandleFunc("/sessions/cleanup", sessionCleanupHandler.Cleanup).Methods("POST")
 
 	return r
 }

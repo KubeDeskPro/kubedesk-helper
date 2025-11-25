@@ -49,6 +49,7 @@ type Session struct {
 	Port         int
 	Context      string
 	Kubeconfig   string
+	ClusterHash  string // Hash of kubeconfig+context for cluster isolation
 
 	// For exec and shell sessions
 	stdin        io.WriteCloser
@@ -145,6 +146,31 @@ func (m *Manager) Get(id string) (*Session, bool) {
 	return session, ok
 }
 
+// GetWithClusterValidation retrieves a session by ID and validates the cluster hash
+// Returns (session, true) if found and cluster hash matches
+// Returns (nil, false) if not found or cluster hash doesn't match
+func (m *Manager) GetWithClusterValidation(id string, clusterHash string) (*Session, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	session, ok := m.sessions[id]
+	if !ok {
+		return nil, false
+	}
+
+	// Validate cluster hash matches
+	if session.ClusterHash != clusterHash {
+		slog.Warn("Cluster hash mismatch",
+			"sessionId", id,
+			"sessionHash", session.ClusterHash,
+			"providedHash", clusterHash,
+		)
+		return nil, false
+	}
+
+	return session, true
+}
+
 // List returns all sessions of a specific type
 func (m *Manager) List(sessionType SessionType) []*Session {
 	m.mu.RLock()
@@ -157,6 +183,54 @@ func (m *Manager) List(sessionType SessionType) []*Session {
 		}
 	}
 	return result
+}
+
+// FindByClusterHash finds all sessions for a specific cluster hash
+func (m *Manager) FindByClusterHash(clusterHash string) []*Session {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var result []*Session
+	for _, session := range m.sessions {
+		if session.ClusterHash == clusterHash {
+			result = append(result, session)
+		}
+	}
+	return result
+}
+
+// CleanupByClusterHash stops and removes all sessions for a specific cluster hash
+// This is called when the app switches clusters
+func (m *Manager) CleanupByClusterHash(clusterHash string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	count := 0
+	for id, session := range m.sessions {
+		if session.ClusterHash == clusterHash {
+			// Kill process if running
+			if session.Cmd != nil && session.Cmd.Process != nil {
+				if err := session.Cmd.Process.Kill(); err != nil {
+					slog.Warn("Failed to kill process during cluster cleanup", "id", id, "error", err)
+				}
+			}
+
+			// Clean up temp files
+			m.cleanupSessionFiles(session)
+
+			// Remove from map
+			delete(m.sessions, id)
+			count++
+
+			slog.Info("Session cleaned up for cluster switch", "id", id, "clusterHash", clusterHash)
+		}
+	}
+
+	if count > 0 {
+		slog.Info("Cluster cleanup completed", "clusterHash", clusterHash, "sessionsRemoved", count)
+	}
+
+	return count
 }
 
 // Stop stops a session and removes it

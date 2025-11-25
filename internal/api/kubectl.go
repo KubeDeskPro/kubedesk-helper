@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/kubedeskpro/kubedesk-helper/internal/cluster"
 	"github.com/kubedeskpro/kubedesk-helper/internal/kubectl"
 )
 
@@ -15,9 +16,10 @@ type KubectlHandler struct{}
 
 // KubectlRequest represents a kubectl command request
 type KubectlRequest struct {
-	Args       []string `json:"args"`
-	Kubeconfig string   `json:"kubeconfig,omitempty"`
-	Context    string   `json:"context,omitempty"`
+	Args        []string `json:"args"`
+	Kubeconfig  string   `json:"kubeconfig,omitempty"`
+	Context     string   `json:"context,omitempty"`
+	ClusterHash string   `json:"clusterHash,omitempty"` // Optional: computed by helper if not provided
 }
 
 // KubectlResponse represents a kubectl command response
@@ -40,6 +42,23 @@ func (h *KubectlHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No kubectl arguments provided", http.StatusBadRequest)
 		return
 	}
+
+	// Compute cluster hash if not provided
+	if req.ClusterHash == "" {
+		req.ClusterHash = cluster.ComputeHash(req.Kubeconfig, req.Context)
+	}
+
+	// Validate cluster hash
+	if !cluster.ValidateHash(req.ClusterHash, req.Kubeconfig, req.Context) {
+		slog.Error("Cluster hash validation failed",
+			"providedHash", req.ClusterHash,
+			"args", req.Args,
+		)
+		http.Error(w, "Cluster hash validation failed", http.StatusBadRequest)
+		return
+	}
+
+	slog.Debug("kubectl request", "args", req.Args, "clusterHash", req.ClusterHash)
 
 	// Execute kubectl command with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

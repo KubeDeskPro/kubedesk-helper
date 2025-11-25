@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kubedeskpro/kubedesk-helper/internal/api"
+	"github.com/kubedeskpro/kubedesk-helper/internal/logging"
 	"github.com/kubedeskpro/kubedesk-helper/internal/session"
 )
 
@@ -21,13 +22,19 @@ const (
 )
 
 func main() {
-	// Setup structured logging
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	// Setup async structured logging for zero-overhead logging
+	logLevel := slog.LevelInfo
+	if os.Getenv("LOG_LEVEL") == "debug" {
+		logLevel = slog.LevelDebug
+	} else if os.Getenv("LOG_LEVEL") == "warn" {
+		logLevel = slog.LevelWarn
+	}
+
+	// Create async logger with 10000 entry queue
+	logger := logging.NewAsyncLogger(os.Stdout, logLevel, 10000)
 	slog.SetDefault(logger)
 
-	slog.Info("Starting KubeDesk Helper", "version", version, "port", port)
+	slog.Info("Starting KubeDesk Helper", "version", version, "port", port, "logLevel", logLevel.String())
 
 	// Create session manager
 	sessionMgr := session.NewManager()
@@ -73,5 +80,10 @@ func main() {
 	}
 
 	slog.Info("Server stopped")
+
+	// Flush async logs before exit
+	if asyncLogger, ok := slog.Default().Handler().(*logging.AsyncHandler); ok {
+		asyncLogger.Close()
+	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/kubedeskpro/kubedesk-helper/internal/cluster"
 	"github.com/kubedeskpro/kubedesk-helper/internal/env"
 	"github.com/kubedeskpro/kubedesk-helper/internal/session"
 )
@@ -29,6 +30,7 @@ type PortForwardStartRequest struct {
 	LocalPort    string `json:"localPort"`
 	Kubeconfig   string `json:"kubeconfig,omitempty"`
 	Context      string `json:"context,omitempty"`
+	ClusterHash  string `json:"clusterHash,omitempty"` // Optional: computed by helper if not provided
 }
 
 // PortForwardStartResponse represents a port-forward start response
@@ -63,6 +65,15 @@ func (h *PortForwardHandler) Start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	slog.Info("Port-forward request received",
+		"namespace", req.Namespace,
+		"resourceType", req.ResourceType,
+		"resourceName", req.ResourceName,
+		"clusterHash", req.ClusterHash,
+		"hasKubeconfig", req.Kubeconfig != "",
+		"hasContext", req.Context != "",
+	)
+
 	// Validate request
 	if req.Namespace == "" || req.ResourceName == "" || req.ServicePort == "" || req.LocalPort == "" {
 		http.Error(w, "Missing required fields", http.StatusBadRequest)
@@ -71,6 +82,48 @@ func (h *PortForwardHandler) Start(w http.ResponseWriter, r *http.Request) {
 
 	if req.ResourceType != "service" && req.ResourceType != "pod" {
 		req.ResourceType = "pod" // Default to pod
+	}
+
+	// If kubeconfig/context not provided, try to look up from registry
+	if req.Kubeconfig == "" && req.Context == "" && req.ClusterHash != "" {
+		regKubeconfig, regContext, foundInRegistry := cluster.GetRegistry().Lookup(req.ClusterHash)
+		if !foundInRegistry {
+			slog.Error("Cluster hash not found in registry and kubeconfig/context not provided",
+				"providedHash", req.ClusterHash,
+				"resource", req.ResourceName,
+				"hint", "This usually happens after helper restart. App should send kubeconfig and context.",
+			)
+			http.Error(w, "Cluster hash not found in registry. Please provide kubeconfig and context in the request.", http.StatusBadRequest)
+			return
+		}
+		req.Kubeconfig = regKubeconfig
+		req.Context = regContext
+		slog.Info("Looked up cluster info from registry",
+			"clusterHash", req.ClusterHash,
+			"context", req.Context,
+		)
+	}
+
+	// Compute cluster hash if not provided
+	if req.ClusterHash == "" {
+		req.ClusterHash = cluster.ComputeAndRegister(req.Kubeconfig, req.Context)
+	} else {
+		// Register the hash with kubeconfig/context for future lookups
+		cluster.GetRegistry().Register(req.ClusterHash, req.Kubeconfig, req.Context)
+	}
+
+	// Validate cluster hash
+	if !cluster.ValidateHash(req.ClusterHash, req.Kubeconfig, req.Context) {
+		expectedHash := cluster.GetExpectedHash(req.Kubeconfig, req.Context)
+		slog.Error("Cluster hash validation failed",
+			"providedHash", req.ClusterHash,
+			"expectedHash", expectedHash,
+			"kubeconfig", req.Kubeconfig,
+			"context", req.Context,
+			"resource", req.ResourceName,
+		)
+		http.Error(w, "Cluster hash validation failed", http.StatusBadRequest)
+		return
 	}
 
 	// Create session
@@ -82,6 +135,7 @@ func (h *PortForwardHandler) Start(w http.ResponseWriter, r *http.Request) {
 	sess.LocalPort = req.LocalPort
 	sess.Context = req.Context
 	sess.Kubeconfig = req.Kubeconfig
+	sess.ClusterHash = req.ClusterHash
 
 	// Find kubectl
 	kubectlPath, err := exec.LookPath("kubectl")
@@ -151,6 +205,23 @@ func (h *PortForwardHandler) Start(w http.ResponseWriter, r *http.Request) {
 func (h *PortForwardHandler) Stop(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	sessionID := vars["sessionId"]
+
+	// Get cluster hash from query parameter (optional)
+	clusterHash := r.URL.Query().Get("clusterHash")
+
+	// Validate cluster hash if provided
+	if clusterHash != "" {
+		sess, ok := h.sessionMgr.GetWithClusterValidation(sessionID, clusterHash)
+		if !ok {
+			slog.Warn("Session not found or cluster hash mismatch",
+				"sessionId", sessionID,
+				"providedHash", clusterHash,
+			)
+			http.Error(w, "Session not found or cluster mismatch", http.StatusNotFound)
+			return
+		}
+		_ = sess // We just needed to validate
+	}
 
 	if err := h.sessionMgr.Stop(sessionID); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
