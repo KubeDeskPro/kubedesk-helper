@@ -16,9 +16,11 @@ import (
 	"github.com/kubedeskpro/kubedesk-helper/internal/session"
 )
 
+// version is set via ldflags during build: -ldflags "-X main.version=x.y.z"
+var version = "dev"
+
 const (
-	version = "2.0.0"
-	port    = 47823
+	port = 47823
 )
 
 func main() {

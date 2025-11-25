@@ -10,18 +10,18 @@ all: build-universal
 
 # Build for current architecture
 build:
-	@echo "Building for current architecture..."
-	go build -o $(BUILD_DIR)/$(BINARY_NAME) .
+	@echo "Building for current architecture (version: $(VERSION))..."
+	go build -ldflags "-X main.version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY_NAME) .
 
 # Build for amd64
 build-amd64:
-	@echo "Building for amd64..."
-	GOARCH=amd64 GOOS=darwin go build -o $(BUILD_DIR)/$(BINARY_NAME)-amd64 .
+	@echo "Building for amd64 (version: $(VERSION))..."
+	GOARCH=amd64 GOOS=darwin go build -ldflags "-X main.version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY_NAME)-amd64 .
 
 # Build for arm64
 build-arm64:
-	@echo "Building for arm64..."
-	GOARCH=arm64 GOOS=darwin go build -o $(BUILD_DIR)/$(BINARY_NAME)-arm64 .
+	@echo "Building for arm64 (version: $(VERSION))..."
+	GOARCH=arm64 GOOS=darwin go build -ldflags "-X main.version=$(VERSION)" -o $(BUILD_DIR)/$(BINARY_NAME)-arm64 .
 
 # Build universal binary (amd64 + arm64)
 build-universal: build-amd64 build-arm64
