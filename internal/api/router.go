@@ -35,7 +35,10 @@ func NewRouter(version string, sessionMgr *session.Manager) *mux.Router {
 	r.HandleFunc("/port-forward/stop/{sessionId}", portForwardHandler.Stop).Methods("DELETE")
 	r.HandleFunc("/port-forward/list", portForwardHandler.List).Methods("GET")
 
-	// Exec session endpoints
+	// Exec endpoints
+	r.HandleFunc("/exec", execHandler.Execute).Methods("POST") // NEW: Synchronous exec (recommended)
+
+	// Exec session endpoints (legacy - deprecated)
 	r.HandleFunc("/exec/start", execHandler.Start).Methods("POST")
 	r.HandleFunc("/exec/input/{sessionId}", execHandler.Input).Methods("POST")
 	r.HandleFunc("/exec/output/{sessionId}", execHandler.Output).Methods("GET")

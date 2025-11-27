@@ -70,22 +70,24 @@ func (h *ProxyHandler) Start(w http.ResponseWriter, r *http.Request) {
 			"context", req.Context,
 		)
 	} else {
-		// If hash is provided, register it with the kubeconfig/context
+		// If hash is provided, VALIDATE it first before registering
+		expectedHash := cluster.ComputeHash(req.Kubeconfig, req.Context)
+		if req.ClusterHash != expectedHash {
+			slog.Error("Cluster hash mismatch - app sent wrong hash!",
+				"providedHash", req.ClusterHash,
+				"expectedHash", expectedHash,
+				"context", req.Context,
+			)
+			http.Error(w, fmt.Sprintf("Cluster hash mismatch: expected %s, got %s", expectedHash, req.ClusterHash), http.StatusBadRequest)
+			return
+		}
+
+		// Hash is valid - register it
 		cluster.GetRegistry().Register(req.ClusterHash, req.Kubeconfig, req.Context)
-		slog.Info("Registered cluster hash",
+		slog.Info("Validated and registered cluster hash",
 			"clusterHash", req.ClusterHash,
 			"context", req.Context,
 		)
-	}
-
-	// Validate cluster hash
-	if !cluster.ValidateHash(req.ClusterHash, req.Kubeconfig, req.Context) {
-		slog.Error("Cluster hash validation failed",
-			"providedHash", req.ClusterHash,
-			"port", req.Port,
-		)
-		http.Error(w, "Cluster hash validation failed", http.StatusBadRequest)
-		return
 	}
 
 	// CRITICAL: Check if there's already a proxy running for this cluster hash
@@ -94,7 +96,19 @@ func (h *ProxyHandler) Start(w http.ResponseWriter, r *http.Request) {
 	existingProxies := h.sessionMgr.FindByClusterHash(req.ClusterHash)
 	for _, existing := range existingProxies {
 		if existing.Type == session.TypeProxy && existing.Status == session.StatusRunning {
-			// Found an existing proxy for this cluster - reuse it!
+			// CRITICAL: Verify the context matches before reusing!
+			// This prevents returning a proxy for the wrong cluster
+			if existing.Context != req.Context {
+				slog.Warn("Found proxy with same hash but different context - NOT reusing",
+					"sessionId", existing.ID,
+					"existingContext", existing.Context,
+					"requestedContext", req.Context,
+					"clusterHash", req.ClusterHash,
+				)
+				continue // Don't reuse - keep looking or create new one
+			}
+
+			// Found an existing proxy for this cluster with matching context - reuse it!
 			slog.Info("Reusing existing proxy for cluster",
 				"sessionId", existing.ID,
 				"clusterHash", req.ClusterHash,
@@ -222,6 +236,20 @@ func (h *ProxyHandler) Start(w http.ResponseWriter, r *http.Request) {
 
 	// Monitor process in background
 	go func() {
+		// CRITICAL: Clean up temp files AFTER kubectl finishes
+		// This ensures kubectl can read the kubeconfig file for the entire duration
+		defer func() {
+			for _, tmpFile := range sess.TempFiles {
+				if err := os.Remove(tmpFile); err != nil && !os.IsNotExist(err) {
+					slog.Warn("Failed to remove temp file", "file", tmpFile, "error", err)
+				} else {
+					slog.Debug("Removed temp file after proxy completed", "file", tmpFile)
+				}
+			}
+			// Clear the list so session cleanup doesn't try to delete them again
+			sess.TempFiles = nil
+		}()
+
 		cmd.Wait()
 		sess.Status = session.StatusStopped
 		slog.Info("Proxy session ended", "id", sess.ID)

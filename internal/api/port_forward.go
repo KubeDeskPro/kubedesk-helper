@@ -108,22 +108,25 @@ func (h *PortForwardHandler) Start(w http.ResponseWriter, r *http.Request) {
 	if req.ClusterHash == "" {
 		req.ClusterHash = cluster.ComputeAndRegister(req.Kubeconfig, req.Context)
 	} else {
-		// Register the hash with kubeconfig/context for future lookups
-		cluster.GetRegistry().Register(req.ClusterHash, req.Kubeconfig, req.Context)
-	}
+		// If hash is provided, VALIDATE it first before registering
+		expectedHash := cluster.ComputeHash(req.Kubeconfig, req.Context)
+		if req.ClusterHash != expectedHash {
+			slog.Error("Cluster hash mismatch - app sent wrong hash!",
+				"providedHash", req.ClusterHash,
+				"expectedHash", expectedHash,
+				"context", req.Context,
+				"resource", req.ResourceName,
+			)
+			http.Error(w, fmt.Sprintf("Cluster hash mismatch: expected %s, got %s", expectedHash, req.ClusterHash), http.StatusBadRequest)
+			return
+		}
 
-	// Validate cluster hash
-	if !cluster.ValidateHash(req.ClusterHash, req.Kubeconfig, req.Context) {
-		expectedHash := cluster.GetExpectedHash(req.Kubeconfig, req.Context)
-		slog.Error("Cluster hash validation failed",
-			"providedHash", req.ClusterHash,
-			"expectedHash", expectedHash,
-			"kubeconfig", req.Kubeconfig,
+		// Hash is valid - register it
+		cluster.GetRegistry().Register(req.ClusterHash, req.Kubeconfig, req.Context)
+		slog.Info("Validated and registered cluster hash",
+			"clusterHash", req.ClusterHash,
 			"context", req.Context,
-			"resource", req.ResourceName,
 		)
-		http.Error(w, "Cluster hash validation failed", http.StatusBadRequest)
-		return
 	}
 
 	// Create session
@@ -185,6 +188,20 @@ func (h *PortForwardHandler) Start(w http.ResponseWriter, r *http.Request) {
 
 	// Monitor process in background
 	go func() {
+		// CRITICAL: Clean up temp files AFTER kubectl finishes
+		// This ensures kubectl can read the kubeconfig file for the entire duration
+		defer func() {
+			for _, tmpFile := range sess.TempFiles {
+				if err := os.Remove(tmpFile); err != nil && !os.IsNotExist(err) {
+					slog.Warn("Failed to remove temp file", "file", tmpFile, "error", err)
+				} else {
+					slog.Debug("Removed temp file after port-forward completed", "file", tmpFile)
+				}
+			}
+			// Clear the list so session cleanup doesn't try to delete them again
+			sess.TempFiles = nil
+		}()
+
 		cmd.Wait()
 		sess.Status = session.StatusStopped
 		slog.Info("Port-forward session ended", "id", sess.ID)

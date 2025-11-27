@@ -534,10 +534,189 @@ paths:
                         remotePort:
                           type: integer
 
+  /exec:
+    post:
+      summary: Execute command in pod (synchronous)
+      description: |
+        Executes a command in a pod and waits for it to complete.
+        This is a SYNCHRONOUS operation - the HTTP request stays open until the command finishes.
+
+        **This is the RECOMMENDED way to exec into pods** because:
+        - No session management needed
+        - No risk of premature cleanup
+        - Automatic temp file cleanup
+        - Simple request/response pattern
+        - Built-in timeout protection
+
+        **Use this for:**
+        - Running commands and getting output (ls, cat, ps, etc.)
+        - Health checks and diagnostics
+        - One-shot operations
+
+        **App behavior:**
+        ```swift
+        let response = try await helperAPI.post("/exec", body: request)
+        if response.exitCode == 0 {
+            showOutput(response.output)
+        } else {
+            showError(response.output, exitCode: response.exitCode)
+        }
+        ```
+
+        The connection will stay open until:
+        - Command completes (success or failure)
+        - Timeout is reached (default: 300 seconds)
+        - Client cancels the request
+
+      operationId: executeExec
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - namespace
+                - podName
+                - command
+              properties:
+                namespace:
+                  type: string
+                  example: "default"
+                podName:
+                  type: string
+                  example: "my-pod-12345"
+                container:
+                  type: string
+                  description: Optional container name (defaults to first container)
+                  example: "app"
+                command:
+                  type: array
+                  items:
+                    type: string
+                  description: Command and arguments to execute
+                  example: ["ls", "-la", "/app"]
+                kubeconfig:
+                  type: string
+                  description: |
+                    Kubeconfig content (YAML). Recommended to always provide this along with context.
+                    Will be written to a temporary file and cleaned up automatically after command completes.
+                  example: "apiVersion: v1\nkind: Config\n..."
+                context:
+                  type: string
+                  description: |
+                    Kubectl context name. Recommended to always provide this along with kubeconfig.
+                  example: "my-cluster"
+                clusterHash:
+                  type: string
+                  description: |
+                    Optional cluster hash for validation (SHA256 of kubeconfig:context, first 16 chars).
+                    If not provided, helper computes it automatically.
+                  example: "a22d510f831cc112"
+                timeout:
+                  type: integer
+                  description: Maximum seconds to wait for command to complete (default: 300)
+                  example: 60
+                  default: 300
+      responses:
+        '200':
+          description: Command completed (check exitCode to determine success/failure)
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - output
+                  - exitCode
+                  - duration
+                properties:
+                  output:
+                    type: string
+                    description: Combined stdout and stderr output
+                    example: "total 48\ndrwxr-xr-x  12 root root 4096 Nov 27 10:00 .\n..."
+                  exitCode:
+                    type: integer
+                    format: int32
+                    description: Exit code (0 = success, non-zero = failure, -1 = error)
+                    example: 0
+                  duration:
+                    type: number
+                    format: float
+                    description: Execution time in seconds
+                    example: 1.234
+                  error:
+                    type: string
+                    description: Error message (only present if exitCode is -1)
+                    example: "kubectl not found in PATH"
+        '400':
+          description: Invalid request (missing fields or cluster hash mismatch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Command execution failed
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - output
+                  - exitCode
+                  - duration
+                properties:
+                  output:
+                    type: string
+                  exitCode:
+                    type: integer
+                    format: int32
+                  duration:
+                    type: number
+                    format: float
+                  error:
+                    type: string
+        '504':
+          description: Command timed out
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - output
+                  - exitCode
+                  - duration
+                  - error
+                properties:
+                  output:
+                    type: string
+                    description: Partial output before timeout
+                  exitCode:
+                    type: integer
+                    format: int32
+                    example: -1
+                  duration:
+                    type: number
+                    format: float
+                  error:
+                    type: string
+                    example: "Command timed out after 300 seconds"
+
   /exec/start:
     post:
-      summary: Start exec session into pod
-      description: Starts an interactive exec session into a pod
+      summary: Start exec session into pod (DEPRECATED - use /exec instead)
+      description: |
+        **DEPRECATED:** This session-based API is deprecated in favor of the synchronous /exec endpoint.
+
+        The session-based API is complex and error-prone:
+        - Requires polling /exec/output
+        - Risk of premature cleanup
+        - Temp file race conditions
+        - Complex app code
+
+        **Use /exec instead** for a simpler, safer API.
+
+        This endpoint is kept for backward compatibility only.
+      deprecated: true
       operationId: startExec
       requestBody:
         required: true
@@ -565,14 +744,6 @@ paths:
                   items:
                     type: string
                   example: ["/bin/sh"]
-                stdin:
-                  type: boolean
-                  description: Attach stdin
-                  default: true
-                tty:
-                  type: boolean
-                  description: Allocate TTY
-                  default: true
                 kubeconfig:
                   type: string
                   description: |

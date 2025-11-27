@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -54,10 +55,22 @@ func (h *ProxyRouterHandler) Route(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if proxySession == nil {
-		slog.Warn("No running proxy found for cluster hash",
+		slog.Error("No running proxy found for cluster hash - helper may have restarted",
 			"clusterHash", clusterHash,
+			"path", targetPath,
+			"method", r.Method,
 		)
-		http.Error(w, "No proxy running for this cluster. Call /proxy/start first.", http.StatusNotFound)
+
+		// Return a clear error that tells the app what to do
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		errorResponse := map[string]interface{}{
+			"error": "No proxy running for this cluster",
+			"clusterHash": clusterHash,
+			"action": "Call POST /proxy/start with kubeconfig and context to start a new proxy",
+			"reason": "Helper may have restarted and lost session state",
+		}
+		json.NewEncoder(w).Encode(errorResponse)
 		return
 	}
 

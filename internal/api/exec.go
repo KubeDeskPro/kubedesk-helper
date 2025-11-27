@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/kubedeskpro/kubedesk-helper/internal/cluster"
@@ -21,7 +23,27 @@ type ExecHandler struct {
 	sessionMgr *session.Manager
 }
 
-// ExecStartRequest represents an exec start request
+// ExecRequest represents a synchronous exec request
+type ExecRequest struct {
+	Namespace   string   `json:"namespace"`
+	PodName     string   `json:"podName"`
+	Container   string   `json:"container,omitempty"`
+	Command     []string `json:"command"`
+	Kubeconfig  string   `json:"kubeconfig,omitempty"`
+	Context     string   `json:"context,omitempty"`
+	ClusterHash string   `json:"clusterHash,omitempty"` // Optional: computed by helper if not provided
+	Timeout     int      `json:"timeout,omitempty"`     // Optional: max seconds to wait (default: 300)
+}
+
+// ExecResponse represents a synchronous exec response
+type ExecResponse struct {
+	Output   string  `json:"output"`
+	ExitCode int32   `json:"exitCode"`
+	Duration float64 `json:"duration"` // Seconds
+	Error    string  `json:"error,omitempty"`
+}
+
+// ExecStartRequest represents an exec start request (legacy session-based API)
 type ExecStartRequest struct {
 	Namespace   string   `json:"namespace"`
 	PodName     string   `json:"podName"`
@@ -52,7 +74,217 @@ type ExecOutputResponse struct {
 	ExitCode  *int32 `json:"exitCode,omitempty"` // Exit code of the command (nil if still running)
 }
 
-// Start handles POST /exec/start
+// Execute handles POST /exec - synchronous exec (recommended)
+func (h *ExecHandler) Execute(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+
+	var req ExecRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		slog.Error("Failed to decode exec request", "error", err)
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate request
+	if req.Namespace == "" || req.PodName == "" || len(req.Command) == 0 {
+		http.Error(w, "Missing required fields: namespace, podName, command", http.StatusBadRequest)
+		return
+	}
+
+	// Set default timeout
+	if req.Timeout == 0 {
+		req.Timeout = 300 // 5 minutes default
+	}
+
+	// Validate or compute cluster hash
+	if req.ClusterHash == "" {
+		req.ClusterHash = cluster.ComputeAndRegister(req.Kubeconfig, req.Context)
+		slog.Debug("Computed cluster hash for exec",
+			"clusterHash", req.ClusterHash,
+			"context", req.Context,
+		)
+	} else {
+		// If hash is provided, VALIDATE it first before registering
+		expectedHash := cluster.ComputeHash(req.Kubeconfig, req.Context)
+		if req.ClusterHash != expectedHash {
+			slog.Error("Cluster hash mismatch - app sent wrong hash!",
+				"providedHash", req.ClusterHash,
+				"expectedHash", expectedHash,
+				"context", req.Context,
+			)
+			http.Error(w, fmt.Sprintf("Cluster hash mismatch: expected %s, got %s", expectedHash, req.ClusterHash), http.StatusBadRequest)
+			return
+		}
+
+		// Hash is valid - register it
+		cluster.GetRegistry().Register(req.ClusterHash, req.Kubeconfig, req.Context)
+		slog.Info("Validated and registered cluster hash",
+			"clusterHash", req.ClusterHash,
+			"context", req.Context,
+		)
+	}
+
+	// Find kubectl
+	kubectlPath, err := exec.LookPath("kubectl")
+	if err != nil {
+		slog.Error("kubectl not found in PATH", "error", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ExecResponse{
+			Output:   "",
+			ExitCode: -1,
+			Duration: time.Since(startTime).Seconds(),
+			Error:    "kubectl not found in PATH",
+		})
+		return
+	}
+
+	// Build kubectl exec command
+	args := []string{"exec", "-i"}
+	if req.Context != "" {
+		args = append(args, "--context", req.Context)
+	}
+	args = append(args, "-n", req.Namespace)
+	if req.Container != "" {
+		args = append(args, "-c", req.Container)
+	}
+	args = append(args, req.PodName, "--")
+	args = append(args, req.Command...)
+
+	cmd := exec.Command(kubectlPath, args...)
+	cmd.Env = env.GetShellEnvironment()
+
+	// Create temp kubeconfig file if provided
+	var tmpFile string
+	if req.Kubeconfig != "" {
+		tmpDir := os.TempDir()
+		tmpFile = filepath.Join(tmpDir, fmt.Sprintf("kubeconfig-exec-%d", time.Now().UnixNano()))
+		if err := os.WriteFile(tmpFile, []byte(req.Kubeconfig), 0600); err != nil {
+			slog.Error("Failed to write kubeconfig", "error", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ExecResponse{
+				Output:   "",
+				ExitCode: -1,
+				Duration: time.Since(startTime).Seconds(),
+				Error:    "Failed to write kubeconfig",
+			})
+			return
+		}
+		// Ensure cleanup happens no matter what
+		defer func() {
+			if err := os.Remove(tmpFile); err != nil && !os.IsNotExist(err) {
+				slog.Warn("Failed to remove temp kubeconfig", "file", tmpFile, "error", err)
+			} else {
+				slog.Debug("Removed temp kubeconfig", "file", tmpFile)
+			}
+		}()
+
+		cmd.Env = append(cmd.Env, fmt.Sprintf("KUBECONFIG=%s", tmpFile))
+
+		slog.Debug("Executing kubectl exec with custom kubeconfig",
+			"command", kubectlPath,
+			"args", args,
+			"kubeconfigFile", tmpFile,
+			"pod", req.PodName,
+			"namespace", req.Namespace,
+			"context", req.Context,
+			"timeout", req.Timeout,
+		)
+	} else {
+		slog.Debug("Executing kubectl exec with default kubeconfig",
+			"command", kubectlPath,
+			"args", args,
+			"pod", req.PodName,
+			"namespace", req.Namespace,
+			"context", req.Context,
+			"timeout", req.Timeout,
+		)
+	}
+
+	// Run command with timeout
+	ctx, cancel := r.Context(), func() {}
+	if req.Timeout > 0 {
+		var timeoutCtx context.Context
+		timeoutCtx, cancel = context.WithTimeout(r.Context(), time.Duration(req.Timeout)*time.Second)
+		ctx = timeoutCtx
+	}
+	defer cancel()
+
+	cmdWithTimeout := exec.CommandContext(ctx, kubectlPath, args...)
+	cmdWithTimeout.Env = cmd.Env
+
+	// Capture combined output (stdout + stderr)
+	output, err := cmdWithTimeout.CombinedOutput()
+	duration := time.Since(startTime).Seconds()
+
+	// Determine exit code
+	var exitCode int32
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = int32(exitErr.ExitCode())
+			slog.Info("Exec completed with error",
+				"pod", req.PodName,
+				"command", req.Command,
+				"exitCode", exitCode,
+				"duration", duration,
+				"outputLength", len(output),
+			)
+		} else if ctx.Err() == context.DeadlineExceeded {
+			exitCode = -1
+			slog.Error("Exec timed out",
+				"pod", req.PodName,
+				"command", req.Command,
+				"timeout", req.Timeout,
+				"duration", duration,
+			)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGatewayTimeout)
+			json.NewEncoder(w).Encode(ExecResponse{
+				Output:   string(output),
+				ExitCode: exitCode,
+				Duration: duration,
+				Error:    fmt.Sprintf("Command timed out after %d seconds", req.Timeout),
+			})
+			return
+		} else {
+			exitCode = -1
+			slog.Error("Exec failed",
+				"pod", req.PodName,
+				"command", req.Command,
+				"error", err,
+				"duration", duration,
+			)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ExecResponse{
+				Output:   string(output),
+				ExitCode: exitCode,
+				Duration: duration,
+				Error:    err.Error(),
+			})
+			return
+		}
+	} else {
+		exitCode = 0
+		slog.Info("Exec completed successfully",
+			"pod", req.PodName,
+			"command", req.Command,
+			"duration", duration,
+			"outputLength", len(output),
+		)
+	}
+
+	// Return response
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ExecResponse{
+		Output:   string(output),
+		ExitCode: exitCode,
+		Duration: duration,
+	})
+}
+
+// Start handles POST /exec/start (legacy session-based API - deprecated)
 func (h *ExecHandler) Start(w http.ResponseWriter, r *http.Request) {
 	var req ExecStartRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -91,22 +323,25 @@ func (h *ExecHandler) Start(w http.ResponseWriter, r *http.Request) {
 	if req.ClusterHash == "" {
 		req.ClusterHash = cluster.ComputeAndRegister(req.Kubeconfig, req.Context)
 	} else {
-		// Register the hash with kubeconfig/context for future lookups
-		cluster.GetRegistry().Register(req.ClusterHash, req.Kubeconfig, req.Context)
-	}
+		// If hash is provided, VALIDATE it first before registering
+		expectedHash := cluster.ComputeHash(req.Kubeconfig, req.Context)
+		if req.ClusterHash != expectedHash {
+			slog.Error("Cluster hash mismatch - app sent wrong hash!",
+				"providedHash", req.ClusterHash,
+				"expectedHash", expectedHash,
+				"context", req.Context,
+				"pod", req.PodName,
+			)
+			http.Error(w, fmt.Sprintf("Cluster hash mismatch: expected %s, got %s", expectedHash, req.ClusterHash), http.StatusBadRequest)
+			return
+		}
 
-	// Validate cluster hash
-	if !cluster.ValidateHash(req.ClusterHash, req.Kubeconfig, req.Context) {
-		expectedHash := cluster.GetExpectedHash(req.Kubeconfig, req.Context)
-		slog.Error("Cluster hash validation failed",
-			"providedHash", req.ClusterHash,
-			"expectedHash", expectedHash,
-			"kubeconfig", req.Kubeconfig,
+		// Hash is valid - register it
+		cluster.GetRegistry().Register(req.ClusterHash, req.Kubeconfig, req.Context)
+		slog.Info("Validated and registered cluster hash",
+			"clusterHash", req.ClusterHash,
 			"context", req.Context,
-			"pod", req.PodName,
 		)
-		http.Error(w, "Cluster hash validation failed", http.StatusBadRequest)
-		return
 	}
 
 	// Create session
@@ -155,6 +390,25 @@ func (h *ExecHandler) Start(w http.ResponseWriter, r *http.Request) {
 
 		// Register temp file for cleanup when session ends
 		sess.TempFiles = append(sess.TempFiles, tmpFile)
+
+		slog.Debug("Executing kubectl exec with custom kubeconfig",
+			"sessionId", sess.ID,
+			"command", kubectlPath,
+			"args", args,
+			"kubeconfigFile", tmpFile,
+			"pod", req.PodName,
+			"namespace", req.Namespace,
+			"context", req.Context,
+		)
+	} else {
+		slog.Debug("Executing kubectl exec with default kubeconfig",
+			"sessionId", sess.ID,
+			"command", kubectlPath,
+			"args", args,
+			"pod", req.PodName,
+			"namespace", req.Namespace,
+			"context", req.Context,
+		)
 	}
 
 	// Setup stdin/stdout/stderr
@@ -203,20 +457,53 @@ func (h *ExecHandler) Start(w http.ResponseWriter, r *http.Request) {
 
 	// Monitor process in background and capture exit code
 	go func() {
+		// CRITICAL: Clean up temp files AFTER kubectl finishes
+		// This ensures kubectl can read the kubeconfig file for the entire duration
+		defer func() {
+			for _, tmpFile := range sess.TempFiles {
+				if err := os.Remove(tmpFile); err != nil && !os.IsNotExist(err) {
+					slog.Warn("Failed to remove temp file", "file", tmpFile, "error", err)
+				} else {
+					slog.Debug("Removed temp file after exec completed", "file", tmpFile)
+				}
+			}
+			// Clear the list so session cleanup doesn't try to delete them again
+			sess.TempFiles = nil
+		}()
+
 		err := cmd.Wait()
 		sess.Status = session.StatusStopped
+
+		// Give stderr/stdout goroutines time to finish copying
+		// This ensures all output is captured before we mark as stopped
+		time.Sleep(100 * time.Millisecond)
 
 		// Capture exit code
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {
 				exitCode := int32(exitErr.ExitCode())
 				sess.ExitCode = &exitCode
-				slog.Info("Exec session ended with error", "id", sess.ID, "exitCode", exitCode)
+				output := sess.ReadOutput()
+				slog.Info("Exec session ended with error",
+					"id", sess.ID,
+					"exitCode", exitCode,
+					"output", output,
+					"pod", sess.PodName,
+					"command", sess.Command,
+				)
 			} else {
 				// Non-exit error (e.g., signal)
 				exitCode := int32(-1)
 				sess.ExitCode = &exitCode
-				slog.Error("Exec session ended with non-exit error", "id", sess.ID, "error", err)
+				output := sess.ReadOutput()
+				slog.Error("Exec session ended with non-exit error",
+					"id", sess.ID,
+					"error", err,
+					"errorType", fmt.Sprintf("%T", err),
+					"output", output,
+					"pod", sess.PodName,
+					"command", sess.Command,
+				)
 			}
 		} else {
 			// Success
