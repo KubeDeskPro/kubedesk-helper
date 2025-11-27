@@ -697,6 +697,21 @@ paths:
                   output:
                     type: string
                     description: Output from the session
+                  timestamp:
+                    type: string
+                    description: Timestamp when session started
+                    example: "2024-01-15T10:30:00Z"
+                  status:
+                    type: string
+                    description: Session status (running, stopped, failed)
+                    enum: [running, stopped, failed]
+                    example: "stopped"
+                  exitCode:
+                    type: integer
+                    format: int32
+                    nullable: true
+                    description: Exit code of the command (null if still running, 0 for success, non-zero for failure)
+                    example: 0
         '404':
           description: Session not found
           content:

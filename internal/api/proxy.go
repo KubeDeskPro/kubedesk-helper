@@ -176,6 +176,14 @@ func (h *ProxyHandler) Start(w http.ResponseWriter, r *http.Request) {
 	cmd := exec.Command(kubectlPath, args...)
 	cmd.Env = env.GetShellEnvironment()
 
+	// Log the exact command being executed
+	slog.Info("Executing kubectl proxy command",
+		"command", kubectlPath,
+		"args", args,
+		"port", assignedPort,
+		"context", req.Context,
+	)
+
 	// Set kubeconfig if provided
 	if req.Kubeconfig != "" {
 		tmpDir := os.TempDir()
@@ -189,6 +197,17 @@ func (h *ProxyHandler) Start(w http.ResponseWriter, r *http.Request) {
 
 		// Register temp file for cleanup when session ends
 		sess.TempFiles = append(sess.TempFiles, tmpFile)
+
+		slog.Info("Using custom kubeconfig for proxy",
+			"sessionId", sess.ID,
+			"kubeconfigFile", tmpFile,
+			"context", req.Context,
+		)
+	} else {
+		slog.Info("Using default kubeconfig for proxy",
+			"sessionId", sess.ID,
+			"context", req.Context,
+		)
 	}
 
 	sess.Cmd = cmd

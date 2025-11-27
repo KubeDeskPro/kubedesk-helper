@@ -49,6 +49,7 @@ type ExecOutputResponse struct {
 	Output    string `json:"output"`
 	Timestamp string `json:"timestamp"`
 	Status    string `json:"status"`
+	ExitCode  *int32 `json:"exitCode,omitempty"` // Exit code of the command (nil if still running)
 }
 
 // Start handles POST /exec/start
@@ -200,11 +201,29 @@ func (h *ExecHandler) Start(w http.ResponseWriter, r *http.Request) {
 		io.Copy(sess.GetOutputBuffer(), stderr)
 	}()
 
-	// Monitor process in background
+	// Monitor process in background and capture exit code
 	go func() {
-		cmd.Wait()
+		err := cmd.Wait()
 		sess.Status = session.StatusStopped
-		slog.Info("Exec session ended", "id", sess.ID)
+
+		// Capture exit code
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				exitCode := int32(exitErr.ExitCode())
+				sess.ExitCode = &exitCode
+				slog.Info("Exec session ended with error", "id", sess.ID, "exitCode", exitCode)
+			} else {
+				// Non-exit error (e.g., signal)
+				exitCode := int32(-1)
+				sess.ExitCode = &exitCode
+				slog.Error("Exec session ended with non-exit error", "id", sess.ID, "error", err)
+			}
+		} else {
+			// Success
+			exitCode := int32(0)
+			sess.ExitCode = &exitCode
+			slog.Info("Exec session ended successfully", "id", sess.ID)
+		}
 	}()
 
 	slog.Info("Exec started", "id", sess.ID, "pod", req.PodName, "command", req.Command)
@@ -299,6 +318,7 @@ func (h *ExecHandler) Output(w http.ResponseWriter, r *http.Request) {
 		Output:    output,
 		Timestamp: sess.StartedAt.Format("2006-01-02T15:04:05Z07:00"),
 		Status:    string(sess.Status),
+		ExitCode:  sess.ExitCode, // Include exit code (nil if still running)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
