@@ -48,6 +48,7 @@ func NewRouter(version string, sessionMgr *session.Manager) *mux.Router {
 	r.HandleFunc("/proxy/start", proxyHandler.Start).Methods("POST")
 	r.HandleFunc("/proxy/stop/{sessionId}", proxyHandler.Stop).Methods("DELETE")
 	r.HandleFunc("/proxy/list", proxyHandler.List).Methods("GET")
+	r.HandleFunc("/proxy/verify/{clusterHash}", proxyHandler.Verify).Methods("GET")
 
 	// Proxy router - routes requests to the correct kubectl proxy based on cluster hash
 	// This allows the app to make requests through the helper instead of directly to kubectl proxy

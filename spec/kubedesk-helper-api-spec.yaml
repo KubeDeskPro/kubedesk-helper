@@ -957,7 +957,27 @@ paths:
   /proxy/start:
     post:
       summary: Start kubectl proxy
-      description: Starts a kubectl proxy server
+      description: |
+        Starts a kubectl proxy server for the specified cluster.
+
+        **CRITICAL SAFETY (v2.3.0+):**
+        The helper ALWAYS assigns a deterministic port based on the cluster hash.
+        The `port` field in the request is IGNORED for safety to prevent cross-cluster contamination.
+
+        **Port Assignment:**
+        - Each cluster hash gets a unique deterministic port (range: 47824-57823)
+        - Same cluster hash ALWAYS gets the same port
+        - Port is computed as: `47824 + (hash % 10000)`
+        - This prevents port conflicts and ensures cluster isolation
+
+        **Proxy Reuse:**
+        If a proxy is already running for this cluster hash, the existing session is returned.
+        This is transparent to the app and improves performance.
+
+        **App Usage:**
+        After starting a proxy, use the returned `clusterHash` to make requests via:
+        `/proxy/{clusterHash}/api/v1/pods` (not the port number!)
+
       operationId: startProxy
       requestBody:
         required: true
@@ -968,19 +988,31 @@ paths:
               properties:
                 port:
                   type: integer
-                  description: Port for proxy server (default 8001)
+                  description: |
+                    DEPRECATED (v2.3.0+): This field is IGNORED for safety.
+                    The helper always assigns a deterministic port based on cluster hash.
+                    Do not send this field - it will be ignored.
+                  deprecated: true
                   example: 8001
                 kubeconfig:
                   type: string
-                  description: Optional kubeconfig content
+                  description: |
+                    Kubeconfig content (YAML). Recommended to always provide this along with context.
+                    Will be written to a temporary file and cleaned up automatically.
+                  example: "apiVersion: v1\nkind: Config\n..."
                 context:
                   type: string
-                  description: Optional kubectl context to use
+                  description: |
+                    Kubectl context name. Recommended to always provide this along with kubeconfig.
+                    This determines which cluster the proxy connects to.
+                  example: "my-cluster"
                 clusterHash:
                   type: string
                   description: |
                     Optional cluster hash for validation (SHA256 of kubeconfig:context, first 16 chars).
-                    If not provided, helper computes it automatically. Session is tied to this cluster.
+                    If not provided, helper computes it automatically.
+
+                    The port is assigned based on this hash to ensure cluster isolation.
                   example: "a22d510f831cc112"
       responses:
         '200':
@@ -1011,6 +1043,93 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+
+  /proxy/verify/{clusterHash}:
+    get:
+      summary: Verify cluster hash and get proxy information
+      description: |
+        Returns information about which cluster a hash belongs to.
+        This allows the app to verify it's talking to the right cluster before making requests.
+
+        **Use this to:**
+        - Verify a cluster hash points to the expected context
+        - Check if a proxy is running for a cluster
+        - Get the port number for a cluster (though you should use /proxy/{clusterHash}/* instead)
+
+        **Example:**
+        ```swift
+        let verification = try await helperAPI.get("/proxy/verify/\(clusterHash)")
+        guard verification.context == expectedContext else {
+            throw ClusterError.hashMismatch(expected: expectedContext, got: verification.context)
+        }
+        ```
+      operationId: verifyProxy
+      parameters:
+        - name: clusterHash
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Cluster hash to verify
+          example: "a22d510f831cc112"
+      responses:
+        '200':
+          description: Proxy found for this cluster hash
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - found
+                  - clusterHash
+                  - context
+                  - port
+                  - sessionId
+                  - status
+                  - startedAt
+                properties:
+                  found:
+                    type: boolean
+                    example: true
+                  clusterHash:
+                    type: string
+                    example: "a22d510f831cc112"
+                  context:
+                    type: string
+                    example: "my-gcp-cluster"
+                  port:
+                    type: integer
+                    example: 52341
+                  sessionId:
+                    type: string
+                    example: "proxy-abc123"
+                  status:
+                    type: string
+                    example: "running"
+                  startedAt:
+                    type: string
+                    format: date-time
+                    example: "2025-11-27T10:00:00Z"
+        '404':
+          description: No proxy found for this cluster hash
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - found
+                  - clusterHash
+                  - error
+                properties:
+                  found:
+                    type: boolean
+                    example: false
+                  clusterHash:
+                    type: string
+                    example: "a22d510f831cc112"
+                  error:
+                    type: string
+                    example: "No running proxy found for this cluster hash"
 
   /proxy/stop/{sessionId}:
     delete:

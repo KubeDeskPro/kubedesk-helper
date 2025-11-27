@@ -128,17 +128,24 @@ func (h *ProxyHandler) Start(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// No existing proxy for this cluster - need to start a new one
-	// Auto-assign port: if app didn't specify, we assign based on cluster hash
-	assignedPort := req.Port
-	if assignedPort == 0 {
-		// Auto-assign a unique port for this cluster hash
-		// We use a deterministic port based on cluster hash to ensure consistency
-		assignedPort = h.assignPortForCluster(req.ClusterHash)
-		slog.Info("Auto-assigned port for cluster",
+	// CRITICAL SAFETY: ALWAYS use deterministic port based on cluster hash
+	// NEVER trust the app's port choice - this prevents cross-cluster contamination
+	assignedPort := h.assignPortForCluster(req.ClusterHash)
+
+	if req.Port != 0 && req.Port != assignedPort {
+		slog.Warn("App requested specific port but we're using deterministic port for safety",
+			"requestedPort", req.Port,
+			"assignedPort", assignedPort,
 			"clusterHash", req.ClusterHash,
-			"port", assignedPort,
+			"reason", "Prevents cross-cluster contamination",
 		)
 	}
+
+	slog.Info("Assigned deterministic port for cluster",
+		"clusterHash", req.ClusterHash,
+		"port", assignedPort,
+		"context", req.Context,
+	)
 
 	// CRITICAL: Check if the assigned port is already in use by a DIFFERENT cluster
 	// If yes, we must kill that proxy first to prevent cross-cluster contamination
@@ -348,6 +355,49 @@ func (h *ProxyHandler) List(w http.ResponseWriter, r *http.Request) {
 	response := ProxyListResponse{Sessions: sessionInfos}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+// Verify handles GET /proxy/verify/{clusterHash}
+// Returns information about which cluster a hash belongs to
+// This allows the app to verify it's talking to the right cluster
+func (h *ProxyHandler) Verify(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	clusterHash := vars["clusterHash"]
+
+	// Find proxy session for this hash
+	proxies := h.sessionMgr.FindByClusterHash(clusterHash)
+	var proxySession *session.Session
+	for _, sess := range proxies {
+		if sess.Type == session.TypeProxy && sess.Status == session.StatusRunning {
+			if sess.ClusterHash == clusterHash {
+				proxySession = sess
+				break
+			}
+		}
+	}
+
+	if proxySession == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"found":       false,
+			"clusterHash": clusterHash,
+			"error":       "No running proxy found for this cluster hash",
+		})
+		return
+	}
+
+	// Return detailed information about the cluster
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"found":       true,
+		"clusterHash": proxySession.ClusterHash,
+		"context":     proxySession.Context,
+		"port":        proxySession.Port,
+		"sessionId":   proxySession.ID,
+		"status":      string(proxySession.Status),
+		"startedAt":   proxySession.StartedAt.Format(time.RFC3339),
+	})
 }
 
 // assignPortForCluster assigns a unique port for a cluster hash

@@ -49,6 +49,18 @@ func (h *ProxyRouterHandler) Route(w http.ResponseWriter, r *http.Request) {
 	var proxySession *session.Session
 	for _, sess := range proxies {
 		if sess.Type == session.TypeProxy && sess.Status == session.StatusRunning {
+			// CRITICAL SAFETY CHECK: Verify cluster hash matches
+			if sess.ClusterHash != clusterHash {
+				slog.Error("CRITICAL: Found proxy with mismatched cluster hash!",
+					"requestedHash", clusterHash,
+					"sessionHash", sess.ClusterHash,
+					"sessionId", sess.ID,
+					"context", sess.Context,
+					"port", sess.Port,
+				)
+				// DO NOT use this proxy - it's for a different cluster!
+				continue
+			}
 			proxySession = sess
 			break
 		}
@@ -65,10 +77,32 @@ func (h *ProxyRouterHandler) Route(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		errorResponse := map[string]interface{}{
-			"error": "No proxy running for this cluster",
+			"error":       "No proxy running for this cluster",
 			"clusterHash": clusterHash,
-			"action": "Call POST /proxy/start with kubeconfig and context to start a new proxy",
-			"reason": "Helper may have restarted and lost session state",
+			"action":      "Call POST /proxy/start with kubeconfig and context to start a new proxy",
+			"reason":      "Helper may have restarted and lost session state",
+		}
+		json.NewEncoder(w).Encode(errorResponse)
+		return
+	}
+
+	// CRITICAL SAFETY: Double-check cluster hash before forwarding
+	if proxySession.ClusterHash != clusterHash {
+		slog.Error("CRITICAL SAFETY VIOLATION: Cluster hash mismatch before forwarding!",
+			"requestedHash", clusterHash,
+			"sessionHash", proxySession.ClusterHash,
+			"sessionId", proxySession.ID,
+			"context", proxySession.Context,
+			"port", proxySession.Port,
+			"path", targetPath,
+		)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		errorResponse := map[string]interface{}{
+			"error":         "CRITICAL: Cluster hash mismatch - refusing to forward request",
+			"requestedHash": clusterHash,
+			"sessionHash":   proxySession.ClusterHash,
+			"reason":        "Safety check failed - this would return data from wrong cluster",
 		}
 		json.NewEncoder(w).Encode(errorResponse)
 		return
@@ -80,9 +114,13 @@ func (h *ProxyRouterHandler) Route(w http.ResponseWriter, r *http.Request) {
 		targetURL += "?" + r.URL.RawQuery
 	}
 
-	slog.Debug("Forwarding to kubectl proxy",
+	slog.Info("Forwarding request to kubectl proxy",
 		"clusterHash", clusterHash,
+		"context", proxySession.Context,
 		"port", proxySession.Port,
+		"path", targetPath,
+		"method", r.Method,
+		"sessionId", proxySession.ID,
 	)
 
 	// Create a new request to the kubectl proxy
